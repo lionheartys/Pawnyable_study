@@ -120,7 +120,7 @@ int create_overlap() {
   pthread_t th1, th2;
   char buf[0x10] = {0};
   cpu_set_t t1_cpu, t2_cpu;
-  // cpu affinity
+  // cpu affinityq
   CPU_ZERO(&t1_cpu);
   CPU_ZERO(&t2_cpu);
   CPU_SET(0, &t1_cpu);
